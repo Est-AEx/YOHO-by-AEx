@@ -22,7 +22,7 @@ N_MELS = 128
 # --- Parámetros de YOLO ---
 YOLO_MODEL = "yolov8n.pt"
 EPOCHS = 100
-BATCH_SIZE = 8
+BATCH_SIZE = -1
 IMG_SIZE_YOLO = 1024
 
 # --- Clases (se llenarán automáticamente desde el CSV) ---
