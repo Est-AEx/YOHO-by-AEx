@@ -1,5 +1,4 @@
 """
-train_rgb.py
 Entrena YOLO26n sobre el dataset RGB de 3 canales.
 """
 

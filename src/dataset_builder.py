@@ -1,5 +1,5 @@
 """
-dataset_builder_rgb.py
+dataset_builder.py
 Construye el dataset YOLO RGB (3 canales, 8 bits) para YOHO.
 
 Reemplaza el dataset anterior de 1 canal en OUTPUT_ROOT.
