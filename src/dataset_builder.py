@@ -1,3 +1,20 @@
+"""
+dataset_builder_rgb.py
+Construye el dataset YOLO RGB (3 canales, 8 bits) para YOHO.
+
+Reemplaza el dataset anterior de 1 canal en OUTPUT_ROOT.
+Cada imagen tiene 3 canales:
+- R: STFT lineal en dB (20 Hz - Nyquist)
+- G: STFT log en dB (20 Hz - Nyquist)
+- B: CQT interpolado a rejilla log (20 Hz - Nyquist)
+
+Ventanas de 24 s con 5 s de solape (hop = 19 s). Se generan TODAS las ventanas
+necesarias para cubrir el dataset completo (~3541).
+Imagenes casi cuadradas: 1024 filas x ~1032 columnas.
+
+Las rutas se importan desde config.py.
+"""
+
 import sys
 import numpy as np
 import pandas as pd
@@ -7,10 +24,8 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 
-# Importar rutas desde config
 sys.path.append(str(Path(__file__).resolve().parent))
 from config import (
-    DATASET_ROOT,
     AUDIO_DIR,
     CSV_MONO,
     OUTPUT_ROOT,
@@ -19,24 +34,59 @@ from config import (
 )
 
 # ============================================================
-# CONFIGURACION LOCAL
+# PARAMETROS DE AUDIO
 # ============================================================
 SR = 44100
-VENTANA_SEG = 24
-SOLAPAMIENTO_SEG = 5
-HOP_SEG = VENTANA_SEG - SOLAPAMIENTO_SEG   # 19 s
-
 N_FFT = 2048
 HOP_LENGTH = 1024
 
-CMAP = "gray"               # fondo negro (silencio), eventos blancos (energia)
-DB_MIN, DB_MAX = -80, 0
+# Rango de frecuencias comun (20 Hz a Nyquist)
+NYQUIST = SR / 2
+FREQ_MIN = 20.0
+FREQ_MAX = NYQUIST
+N_FILAS = 1024
 
+# CQT
+CQT_BINS_POR_OCTAVA = 12
+CQT_N_BINS = 120
+CQT_FMIN = 20.0
+
+# ============================================================
+# PARAMETROS DE VENTANAS
+# ============================================================
+VENTANA_SEG = 24
+SOLAPAMIENTO_SEG = 6
+HOP_SEG = VENTANA_SEG - SOLAPAMIENTO_SEG  # 19 s
+
+# ============================================================
+# PARAMETROS DE CADA CANAL
+# ============================================================
+# Canal R
+R_VMIN = -70
+R_VMAX = -6
+R_INVERTIR_X = False
+R_INVERTIR_Y = False
+
+# Canal G
+G_VMIN = -50
+G_VMAX = -3
+G_INVERTIR_X = False
+G_INVERTIR_Y = False
+
+# Canal B
+B_VMIN = -50
+B_VMAX = -6
+B_INVERTIR_X = False
+B_INVERTIR_Y = False
+
+# ============================================================
+# RUTAS DE SALIDA (usan OUTPUT_ROOT directamente)
+# ============================================================
 DATA_YAML = OUTPUT_ROOT / "data.yaml"
 
 
 # ============================================================
-# PASO 1: LINEA DE TIEMPO GLOBAL
+# LINEA DE TIEMPO GLOBAL
 # ============================================================
 def construir_linea_tiempo(audio_dir):
     audios = sorted([f.name for f in Path(audio_dir).glob("*.wav")])
@@ -45,155 +95,213 @@ def construir_linea_tiempo(audio_dir):
     for audio in audios:
         info = sf.info(Path(audio_dir) / audio)
         dur = info.duration
-        registros.append({
-            'sound_name': audio,
-            'offset_global': offset,
-            'duracion': dur
-        })
+        registros.append({'sound_name': audio, 'offset_global': offset, 'duracion': dur})
         offset += dur
     return pd.DataFrame(registros), offset
 
 
 # ============================================================
-# PASO 2: GENERAR VENTANAS
+# VENTANAS (sin limite, se generan todas)
 # ============================================================
 def generar_ventanas(duracion_total, ventana_seg, hop_seg):
     ventanas = []
     inicio = 0.0
     while inicio < duracion_total:
-        fin = inicio + ventana_seg
-        ventanas.append((inicio, fin))
+        ventanas.append((inicio, inicio + ventana_seg))
         inicio += hop_seg
     return ventanas
 
 
-# ============================================================
-# PASO 3: EXTRAER AUDIO DE UNA VENTANA
-# ============================================================
 def extraer_audio_ventana(inicio, fin, df_timeline, audio_dir, sr):
-    longitud_muestras = int((fin - inicio) * sr)
-    buffer = np.zeros(longitud_muestras, dtype=np.float32)
-
+    longitud = int((fin - inicio) * sr)
+    buffer = np.zeros(longitud, dtype=np.float32)
     for _, row in df_timeline.iterrows():
-        audio_ini = row['offset_global']
-        audio_fin = audio_ini + row['duracion']
-
-        solape_ini = max(inicio, audio_ini)
-        solape_fin = min(fin, audio_fin)
-        if solape_fin <= solape_ini:
+        a_ini = row['offset_global']
+        a_fin = a_ini + row['duracion']
+        s_ini = max(inicio, a_ini)
+        s_fin = min(fin, a_fin)
+        if s_fin <= s_ini:
             continue
-
-        t_ini_local = solape_ini - audio_ini
-        t_fin_local = solape_fin - audio_ini
+        t_ini = s_ini - a_ini
+        t_fin = s_fin - a_ini
         y, _ = librosa.load(
             Path(audio_dir) / row['sound_name'],
-            sr=sr, mono=True,
-            offset=t_ini_local, duration=t_fin_local - t_ini_local
+            sr=sr, mono=True, offset=t_ini, duration=t_fin - t_ini
         )
-
-        pos_ini = int((solape_ini - inicio) * sr)
-        pos_fin = pos_ini + len(y)
-        buffer[pos_ini:pos_fin] = y
-
+        pos = int((s_ini - inicio) * sr)
+        buffer[pos:pos + len(y)] = y
     return buffer
 
 
 # ============================================================
-# PASO 4: GENERAR ESPECTROGRAMA EN PNG DE 16 BITS (MODO I;16)
+# CALCULO DE CADA CANAL (matriz 2D en uint8)
 # ============================================================
-def generar_espectrograma(y, sr, n_fft, hop_length, cmap, out_path):
-    """
-    Genera un espectrograma STFT en escala de grises y lo guarda como PNG
-    de 16 bits (modo I;16, 1 canal, 16 bits por pixel).
-
-    Convencion estandar:
-    - Eje X: tiempo (izquierda = inicio, derecha = final).
-    - Eje Y: frecuencia (abajo = 0 Hz, arriba = Nyquist).
-    - Fondo negro (silencio), eventos blancos (energia) con cmap='gray'.
-    """
+def calcular_canal_r(y, sr, n_fft, hop_length, n_filas,
+                     freq_min, freq_max, vmin, vmax,
+                     invertir_x, invertir_y):
+    """Canal R: STFT lineal en dB, rejilla lineal de freq_min a freq_max."""
     stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-    magnitud = np.abs(stft)
-    magnitud_db = librosa.amplitude_to_db(magnitud, ref=np.max)
+    mag_db = librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+    freqs_stft = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
 
-    # Normalizar a rango 0-65535 (16 bits)
-    img_array = np.clip((magnitud_db - DB_MIN) / (DB_MAX - DB_MIN), 0, 1)
-    img_uint16 = (img_array * 65535).astype(np.uint16)
+    mask = (freqs_stft >= freq_min) & (freqs_stft <= freq_max)
+    freqs_r = freqs_stft[mask]
+    mag_r = mag_db[mask, :]
+    n_frames = mag_r.shape[1]
 
-    # cmap='gray': valores bajos -> negro (0), valores altos -> blanco (65535)
-    # cmap='gray_r': invertir
-    if cmap == "gray_r":
-        img_uint16 = 65535 - img_uint16
+    freqs_lineal = np.linspace(freq_min, freq_max, n_filas)
 
-    # Invertir eje vertical: en el array, fila 0 = 0 Hz.
-    # Al guardar con Pillow, fila 0 queda arriba.
-    # flipud pone las frecuencias bajas abajo (convencion estandar).
-    img_uint16 = np.flipud(img_uint16)
+    canal = np.zeros((n_filas, n_frames), dtype=np.float32)
+    for i in range(n_frames):
+        canal[:, i] = np.interp(freqs_lineal, freqs_r, mag_r[:, i])
 
-    # Crear imagen SIN especificar mode (Pillow lo infiere del dtype)
-    img = Image.fromarray(img_uint16)
+    canal_norm = np.clip((canal - vmin) / (vmax - vmin), 0, 1)
+    canal_u8 = (canal_norm * 255).astype(np.uint8)
 
-    # Asegurar que el modo sea I;16 antes de guardar
-    if img.mode != 'I;16':
-        img = img.convert('I;16')
+    if invertir_x:
+        canal_u8 = np.fliplr(canal_u8)
+    if invertir_y:
+        canal_u8 = np.flipud(canal_u8)
 
+    return canal_u8
+
+
+def calcular_canal_g(y, sr, n_fft, hop_length, n_filas,
+                     freq_min, freq_max, vmin, vmax,
+                     invertir_x, invertir_y):
+    """Canal G: STFT log en dB, rejilla logaritmica de freq_min a freq_max."""
+    stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+    mag_db = librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+    freqs_stft = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
+    mask = (freqs_stft >= freq_min) & (freqs_stft <= freq_max)
+    freqs_r = freqs_stft[mask]
+    mag_r = mag_db[mask, :]
+    n_frames = mag_r.shape[1]
+
+    freqs_log = np.logspace(np.log10(freq_min), np.log10(freq_max), n_filas)
+
+    canal = np.zeros((n_filas, n_frames), dtype=np.float32)
+    for i in range(n_frames):
+        canal[:, i] = np.interp(freqs_log, freqs_r, mag_r[:, i])
+
+    canal_norm = np.clip((canal - vmin) / (vmax - vmin), 0, 1)
+    canal_u8 = (canal_norm * 255).astype(np.uint8)
+
+    if invertir_x:
+        canal_u8 = np.fliplr(canal_u8)
+    if invertir_y:
+        canal_u8 = np.flipud(canal_u8)
+
+    return canal_u8
+
+
+def calcular_canal_b(y, sr, hop_length, n_filas,
+                     freq_min, freq_max, cqt_fmin, cqt_n_bins, cqt_bpo,
+                     vmin, vmax, invertir_x, invertir_y):
+    """Canal B: CQT interpolado a rejilla logaritmica de freq_min a freq_max."""
+    cqt = np.abs(librosa.cqt(
+        y, sr=sr, hop_length=hop_length,
+        fmin=cqt_fmin, n_bins=cqt_n_bins, bins_per_octave=cqt_bpo
+    ))
+    cqt_db = librosa.amplitude_to_db(cqt, ref=np.max)
+    freqs_cqt = librosa.cqt_frequencies(
+        n_bins=cqt_n_bins, fmin=cqt_fmin, bins_per_octave=cqt_bpo
+    )
+    n_frames = cqt_db.shape[1]
+
+    freqs_log = np.logspace(np.log10(freq_min), np.log10(freq_max), n_filas)
+
+    canal = np.zeros((n_filas, n_frames), dtype=np.float32)
+    for i in range(n_frames):
+        canal[:, i] = np.interp(freqs_log, freqs_cqt, cqt_db[:, i])
+
+    canal_norm = np.clip((canal - vmin) / (vmax - vmin), 0, 1)
+    canal_u8 = (canal_norm * 255).astype(np.uint8)
+
+    if invertir_x:
+        canal_u8 = np.fliplr(canal_u8)
+    if invertir_y:
+        canal_u8 = np.flipud(canal_u8)
+
+    return canal_u8
+
+
+# ============================================================
+# CONSTRUCCION DE LA IMAGEN RGB
+# ============================================================
+def generar_imagen_rgb(y, sr, out_path):
+    """Genera una imagen RGB de 8 bits con 3 canales y la guarda."""
+    canal_r = calcular_canal_r(
+        y, sr, N_FFT, HOP_LENGTH, N_FILAS,
+        FREQ_MIN, FREQ_MAX, R_VMIN, R_VMAX,
+        R_INVERTIR_X, R_INVERTIR_Y
+    )
+    canal_g = calcular_canal_g(
+        y, sr, N_FFT, HOP_LENGTH, N_FILAS,
+        FREQ_MIN, FREQ_MAX, G_VMIN, G_VMAX,
+        G_INVERTIR_X, G_INVERTIR_Y
+    )
+    canal_b = calcular_canal_b(
+        y, sr, HOP_LENGTH, N_FILAS,
+        FREQ_MIN, FREQ_MAX, CQT_FMIN, CQT_N_BINS, CQT_BINS_POR_OCTAVA,
+        B_VMIN, B_VMAX, B_INVERTIR_X, B_INVERTIR_Y
+    )
+
+    # Igualar frames (por si el CQT tiene uno menos)
+    min_frames = min(canal_r.shape[1], canal_g.shape[1], canal_b.shape[1])
+    canal_r = canal_r[:, :min_frames]
+    canal_g = canal_g[:, :min_frames]
+    canal_b = canal_b[:, :min_frames]
+
+    # Apilar en RGB
+    rgb = np.stack([canal_r, canal_g, canal_b], axis=-1)
+
+    # Invertir verticalmente para guardar con orientacion correcta
+    rgb_guardar = np.flipud(rgb)
+
+    img = Image.fromarray(rgb_guardar, mode='RGB')
     img.save(out_path, format='PNG')
-
     return img.width, img.height
 
 
 # ============================================================
-# PASO 5: CALCULAR CAJAS YOLO PARA UNA VENTANA
+# CAJAS YOLO
 # ============================================================
 def calcular_cajas(ventana_ini, ventana_fin, df_eventos, df_timeline, clase_a_id):
-    """
-    Calcula las cajas YOLO de los eventos que caen en la ventana.
-    Cajas de ancho completo en frecuencia: y_center=0.5, h=1.0.
-    La inversion del eje Y no afecta a las cajas (cubren todo el alto).
-    """
     lineas = []
-    duracion_ventana = ventana_fin - ventana_ini
-
+    dur = ventana_fin - ventana_ini
     for _, ev in df_eventos.iterrows():
         offset = df_timeline.loc[
             df_timeline['sound_name'] == ev['sound_name'], 'offset_global'
         ].values[0]
-
         t_ini_abs = offset + ev['start_time']
         t_fin_abs = offset + ev['end_time']
-
         t_ini_rec = max(t_ini_abs, ventana_ini)
         t_fin_rec = min(t_fin_abs, ventana_fin)
-
         if t_fin_rec <= t_ini_rec:
             continue
-
-        x_ini = (t_ini_rec - ventana_ini) / duracion_ventana
-        x_fin = (t_fin_rec - ventana_ini) / duracion_ventana
-
+        x_ini = (t_ini_rec - ventana_ini) / dur
+        x_fin = (t_fin_rec - ventana_ini) / dur
         x_center = (x_ini + x_fin) / 2
         w = x_fin - x_ini
-        y_center = 0.5
-        h = 1.0
-
-        clase_id = clase_a_id[ev['class_name']]
-        lineas.append(f"{clase_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
-
+        cid = clase_a_id[ev['class_name']]
+        lineas.append(f"{cid} {x_center:.6f} 0.500000 {w:.6f} 1.000000")
     return lineas
 
 
 # ============================================================
-# PASO 6: GENERAR data.yaml CON channels: 1
+# DATA YAML (SIN channels: 1, porque es RGB)
 # ============================================================
 def generar_data_yaml(clases, out_path, output_root):
     with open(out_path, 'w') as f:
         f.write(f"path: {output_root}\n")
         f.write("train: images\n")
         f.write("val: images\n")
-        f.write("channels: 1\n")
         f.write(f"\nnc: {len(clases)}\n")
         f.write("names:\n")
-        for i, clase in enumerate(clases):
-            f.write(f"  {i}: {clase}\n")
+        for i, c in enumerate(clases):
+            f.write(f"  {i}: {c}\n")
 
 
 # ============================================================
@@ -201,16 +309,25 @@ def generar_data_yaml(clases, out_path, output_root):
 # ============================================================
 def main():
     print("=" * 60)
-    print("CONSTRUYENDO DATASET YOLO PARA YOHO")
+    print("CONSTRUYENDO DATASET YOLO RGB (3 CANALES)")
     print("=" * 60)
+    print(f"OUTPUT_ROOT: {OUTPUT_ROOT}")
+    print(f"SR: {SR} Hz")
+    print(f"Nyquist: {NYQUIST} Hz")
+    print(f"FREQ_MIN: {FREQ_MIN} Hz, FREQ_MAX: {FREQ_MAX} Hz")
+    print(f"N_FILAS: {N_FILAS}")
+    print(f"VENTANA_SEG: {VENTANA_SEG} s, SOLAPAMIENTO: {SOLAPAMIENTO_SEG} s")
+    print(f"HOP_SEG: {HOP_SEG} s")
+    print(f"R: vmin={R_VMIN}, vmax={R_VMAX}")
+    print(f"G: vmin={G_VMIN}, vmax={G_VMAX}")
+    print(f"B: vmin={B_VMIN}, vmax={B_VMAX}")
 
     SPECTROGRAM_DIR.mkdir(parents=True, exist_ok=True)
     LABELS_DIR.mkdir(parents=True, exist_ok=True)
 
     df_eventos = pd.read_csv(CSV_MONO)
-    print(f"Eventos en CSV: {len(df_eventos)}")
+    print(f"\nEventos en CSV: {len(df_eventos)}")
 
-    print("\nConstruyendo linea de tiempo global...")
     df_timeline, duracion_total = construir_linea_tiempo(AUDIO_DIR)
     print(f"Audios: {len(df_timeline)}")
     print(f"Duracion total: {duracion_total:.1f} s ({duracion_total/60:.1f} min)")
@@ -225,33 +342,30 @@ def main():
     generar_data_yaml(clases, DATA_YAML, OUTPUT_ROOT)
     print(f"data.yaml generado en: {DATA_YAML}")
 
-    # --- Modo de prueba: descomenta para probar con 5 ventanas ---
+    # Modo de prueba: descomenta para probar con 5 ventanas
     # ventanas = ventanas[:5]
 
-    print("\nGenerando ventanas...")
+    print("\nGenerando imagenes RGB...")
     anchos = set()
     alturas = set()
     for i, (v_ini, v_fin) in enumerate(tqdm(ventanas)):
-        nombre = f"X-{i:04d}"
-
+        nombre = f"RGB-{i:04d}"
         y = extraer_audio_ventana(v_ini, v_fin, df_timeline, AUDIO_DIR, SR)
-
         img_path = SPECTROGRAM_DIR / f"{nombre}.png"
-        ancho, alto = generar_espectrograma(y, SR, N_FFT, HOP_LENGTH, CMAP, img_path)
+        ancho, alto = generar_imagen_rgb(y, SR, img_path)
         anchos.add(ancho)
         alturas.add(alto)
 
         lineas = calcular_cajas(v_ini, v_fin, df_eventos, df_timeline, clase_a_id)
-
         label_path = LABELS_DIR / f"{nombre}.txt"
         with open(label_path, 'w') as f:
             f.write("\n".join(lineas))
 
-    print(f"\nDataset generado en: {OUTPUT_ROOT}")
+    print(f"\nDataset RGB generado en: {OUTPUT_ROOT}")
     print(f"   Imagenes: {len(list(SPECTROGRAM_DIR.glob('*.png')))}")
     print(f"   Labels:   {len(list(LABELS_DIR.glob('*.txt')))}")
-    print(f"   Anchos de imagen unicos:  {sorted(anchos)}")
-    print(f"   Alturas de imagen unicas: {sorted(alturas)}")
+    print(f"   Anchos unicos:  {sorted(anchos)}")
+    print(f"   Alturas unicas: {sorted(alturas)}")
 
 
 if __name__ == "__main__":
